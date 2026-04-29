@@ -13,6 +13,14 @@ from pathlib import Path
 from tkinter import messagebox, ttk
 
 try:
+    import pystray
+    from PIL import Image, ImageDraw
+except ImportError:
+    pystray = None
+    Image = None
+    ImageDraw = None
+
+try:
     import psutil
 except ImportError:
     psutil = None
@@ -239,7 +247,7 @@ class NetworkMonitorApp:
         self.window.title(APP_TITLE)
         self.window.geometry("1360x780")
         self.window.minsize(1080, 620)
-        self.window.protocol("WM_DELETE_WINDOW", self.close)
+        self.window.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
         self.settings = load_settings()
         filters = self.settings.get("filters", {})
         view = self.settings.get("view", {})
@@ -275,8 +283,10 @@ class NetworkMonitorApp:
         self.lookup_poll_job: str | None = None
         self.lookup_results: queue.Queue[str] = queue.Queue()
         self.lookup_executor = ThreadPoolExecutor(max_workers=4)
+        self.tray_icon: pystray.Icon | None = None
         self.build_menu()
         self.build_layout()
+        self.setup_tray_icon()
         self.poll_lookup_results()
         self.refresh_connections()
 
@@ -458,6 +468,41 @@ class NetworkMonitorApp:
         self.save_settings()
         messagebox.showinfo(APP_TITLE, tr("message.restart_required"))
 
+    def setup_tray_icon(self) -> None:
+        if pystray is None or Image is None or ImageDraw is None:
+            return
+        menu = pystray.Menu(
+            pystray.MenuItem(tr("tray.show"), lambda _icon, _item: self.window.after(0, self.show_window)),
+            pystray.MenuItem(tr("tray.exit"), lambda _icon, _item: self.window.after(0, self.exit_app)),
+        )
+        self.tray_icon = pystray.Icon(APP_TITLE, self.create_tray_image(), APP_TITLE, menu)
+        self.tray_icon.run_detached()
+
+    def create_tray_image(self) -> object:
+        image = Image.new("RGBA", (64, 64), (18, 24, 38, 0))
+        draw = ImageDraw.Draw(image)
+        draw.ellipse((6, 6, 58, 58), fill=(28, 96, 191, 255))
+        draw.ellipse((17, 17, 47, 47), fill=(255, 255, 255, 255))
+        draw.ellipse((25, 25, 39, 39), fill=(28, 96, 191, 255))
+        draw.arc((11, 11, 53, 53), start=25, end=155, fill=(122, 220, 180, 255), width=5)
+        return image
+
+    def hide_to_tray(self) -> None:
+        if self.tray_icon is None:
+            messagebox.showwarning(APP_TITLE, tr("tray.unavailable"))
+            self.window.iconify()
+            return
+        self.save_settings()
+        self.window.withdraw()
+
+    def show_window(self) -> None:
+        self.window.deiconify()
+        self.window.lift()
+        self.window.focus_force()
+
+    def exit_app(self) -> None:
+        self.close()
+
     def update_tree_mode(self) -> None:
         if self.group_by_process_var.get():
             for tree in (self.current_tree, self.log_tree):
@@ -502,6 +547,9 @@ class NetworkMonitorApp:
         if self.lookup_poll_job is not None:
             self.window.after_cancel(self.lookup_poll_job)
             self.lookup_poll_job = None
+        if self.tray_icon is not None:
+            self.tray_icon.stop()
+            self.tray_icon = None
         self.lookup_executor.shutdown(wait=False, cancel_futures=True)
         self.window.destroy()
 

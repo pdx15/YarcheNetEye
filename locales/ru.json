@@ -51,5 +51,8 @@
   "status.ready": "Готово",
   "status.updated": "Обновлено: {timestamp} | текущих: {visible_current}/{total_current} | новых: +{new_events} | журнал: {visible_events}/{total_events}",
   "tab.current_connections": "Текущие соединения",
-  "tab.new_connections_log": "Журнал новых подключений"
+  "tab.new_connections_log": "Журнал новых подключений",
+  "tray.exit": "Выход",
+  "tray.show": "Показать окно",
+  "tray.unavailable": "Системный трей недоступен. Установите зависимость: python -m pip install -r requirements.txt"
 }
