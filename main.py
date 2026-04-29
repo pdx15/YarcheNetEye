@@ -1,8 +1,10 @@
 import ipaddress
+import json
 import socket
 import tkinter as tk
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from tkinter import messagebox, ttk
 
 try:
@@ -14,6 +16,7 @@ APP_TITLE = "Yarche Net Eye"
 REFRESH_MS = 2000
 ALL_PROTOCOLS = "Все типы"
 ALL_STATUSES = "Все состояния"
+SETTINGS_FILE = Path(__file__).with_name("settings.json")
 
 COLUMNS = {
     "pid": {"title": "PID", "width": 80, "anchor": "center", "stretch": False},
@@ -29,6 +32,30 @@ COLUMNS = {
 CURRENT_COLUMNS = tuple(COLUMNS)
 LOG_COLUMNS = ("first_seen", *CURRENT_COLUMNS)
 LOG_TIME_COLUMN = {"title": "Время", "width": 90, "anchor": "center", "stretch": False}
+
+def load_settings() -> dict[str, object]:
+    if not SETTINGS_FILE.exists():
+        return {}
+
+    try:
+        with SETTINGS_FILE.open("r", encoding="utf-8") as file:
+            settings = json.load(file)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+    return settings if isinstance(settings, dict) else {}
+
+def bool_setting(value: object, default: bool) -> bool:
+    return value if isinstance(value, bool) else default
+
+def text_setting(value: object, default: str, allowed: tuple[str, ...] | None = None) -> str:
+    if not isinstance(value, str):
+        return default
+
+    if allowed is not None and value not in allowed:
+        return default
+
+    return value
 
 @dataclass(frozen=True)
 class NetworkConnection:
@@ -138,16 +165,34 @@ class NetworkMonitorApp:
         self.window.title(APP_TITLE)
         self.window.geometry("1360x780")
         self.window.minsize(1080, 620)
+        self.window.protocol("WM_DELETE_WINDOW", self.close)
 
-        self.search_var = tk.StringVar()
-        self.protocol_filter_var = tk.StringVar(value=ALL_PROTOCOLS)
-        self.status_filter_var = tk.StringVar(value=ALL_STATUSES)
-        self.auto_refresh_var = tk.BooleanVar(value=True)
-        self.external_only_var = tk.BooleanVar(value=False)
-        self.with_remote_only_var = tk.BooleanVar(value=False)
-        self.established_only_var = tk.BooleanVar(value=False)
+        self.settings = load_settings()
+        filters = self.settings.get("filters", {})
+        columns = self.settings.get("columns", {})
+        filters = filters if isinstance(filters, dict) else {}
+        columns = columns if isinstance(columns, dict) else {}
+
+        self.search_var = tk.StringVar(value=text_setting(filters.get("search"), ""))
+        self.protocol_filter_var = tk.StringVar(
+            value=text_setting(filters.get("protocol"), ALL_PROTOCOLS, (ALL_PROTOCOLS, "TCP", "UDP"))
+        )
+        self.status_filter_var = tk.StringVar(
+            value=text_setting(
+                filters.get("status"),
+                ALL_STATUSES,
+                (ALL_STATUSES, "ESTABLISHED", "LISTEN", "TIME_WAIT", "CLOSE_WAIT", "SYN_SENT", "UDP"),
+            )
+        )
+        self.auto_refresh_var = tk.BooleanVar(value=bool_setting(filters.get("auto_refresh"), True))
+        self.external_only_var = tk.BooleanVar(value=bool_setting(filters.get("external_only"), False))
+        self.with_remote_only_var = tk.BooleanVar(value=bool_setting(filters.get("with_remote_only"), False))
+        self.established_only_var = tk.BooleanVar(value=bool_setting(filters.get("established_only"), False))
         self.status_var = tk.StringVar(value="Готово")
-        self.column_vars = {column: tk.BooleanVar(value=True) for column in CURRENT_COLUMNS}
+        self.column_vars = {
+            column: tk.BooleanVar(value=bool_setting(columns.get(column), True))
+            for column in CURRENT_COLUMNS
+        }
 
         self.rows: list[NetworkConnection] = []
         self.events: list[ConnectionEvent] = []
@@ -191,7 +236,7 @@ class NetworkMonitorApp:
 
         search = ttk.Entry(header, textvariable=self.search_var)
         search.grid(row=0, column=1, sticky="ew", padx=(0, 12))
-        search.bind("<KeyRelease>", lambda _event: self.render_tables())
+        search.bind("<KeyRelease>", lambda _event: self.on_filter_changed())
 
         refresh_button = ttk.Button(header, text="Обновить", command=self.refresh_connections)
         refresh_button.grid(row=0, column=2, padx=(0, 12))
@@ -200,7 +245,7 @@ class NetworkMonitorApp:
             header,
             text="Автообновление",
             variable=self.auto_refresh_var,
-            command=self.schedule_refresh,
+            command=self.on_auto_refresh_changed,
         )
         auto_refresh.grid(row=0, column=3)
 
@@ -217,7 +262,7 @@ class NetworkMonitorApp:
             width=12,
         )
         protocol_filter.grid(row=0, column=1, sticky="w", padx=(0, 14))
-        protocol_filter.bind("<<ComboboxSelected>>", lambda _event: self.render_tables())
+        protocol_filter.bind("<<ComboboxSelected>>", lambda _event: self.on_filter_changed())
 
         ttk.Label(filters, text="Состояние").grid(row=0, column=2, sticky="w", padx=(0, 6))
         status_filter = ttk.Combobox(
@@ -228,13 +273,13 @@ class NetworkMonitorApp:
             width=16,
         )
         status_filter.grid(row=0, column=3, sticky="w", padx=(0, 14))
-        status_filter.bind("<<ComboboxSelected>>", lambda _event: self.render_tables())
+        status_filter.bind("<<ComboboxSelected>>", lambda _event: self.on_filter_changed())
 
         external_only = ttk.Checkbutton(
             filters,
             text="Только внешние",
             variable=self.external_only_var,
-            command=self.render_tables,
+            command=self.on_filter_changed,
         )
         external_only.grid(row=0, column=4, sticky="w", padx=(0, 14))
 
@@ -242,7 +287,7 @@ class NetworkMonitorApp:
             filters,
             text="С удаленным адресом",
             variable=self.with_remote_only_var,
-            command=self.render_tables,
+            command=self.on_filter_changed,
         )
         with_remote_only.grid(row=0, column=5, sticky="w", padx=(0, 14))
 
@@ -250,7 +295,7 @@ class NetworkMonitorApp:
             filters,
             text="Только ESTABLISHED",
             variable=self.established_only_var,
-            command=self.render_tables,
+            command=self.on_filter_changed,
         )
         established_only.grid(row=0, column=6, sticky="w", padx=(0, 14))
 
@@ -316,6 +361,7 @@ class NetworkMonitorApp:
 
         self.current_tree.configure(displaycolumns=tuple(visible))
         self.log_tree.configure(displaycolumns=("first_seen", *visible))
+        self.save_settings()
 
     def reset_filters(self) -> None:
         self.search_var.set("")
@@ -324,7 +370,45 @@ class NetworkMonitorApp:
         self.external_only_var.set(False)
         self.with_remote_only_var.set(False)
         self.established_only_var.set(False)
+        self.on_filter_changed()
+
+    def on_filter_changed(self) -> None:
         self.render_tables()
+        self.save_settings()
+
+    def on_auto_refresh_changed(self) -> None:
+        self.schedule_refresh()
+        self.save_settings()
+
+    def save_settings(self) -> None:
+        settings = {
+            "filters": {
+                "search": self.search_var.get(),
+                "protocol": self.protocol_filter_var.get(),
+                "status": self.status_filter_var.get(),
+                "auto_refresh": self.auto_refresh_var.get(),
+                "external_only": self.external_only_var.get(),
+                "with_remote_only": self.with_remote_only_var.get(),
+                "established_only": self.established_only_var.get(),
+            },
+            "columns": {
+                column: variable.get()
+                for column, variable in self.column_vars.items()
+            },
+        }
+
+        try:
+            with SETTINGS_FILE.open("w", encoding="utf-8") as file:
+                json.dump(settings, file, ensure_ascii=False, indent=2)
+        except OSError as error:
+            self.status_var.set(f"Не удалось сохранить настройки: {error}")
+
+    def close(self) -> None:
+        self.save_settings()
+        if self.refresh_job is not None:
+            self.window.after_cancel(self.refresh_job)
+            self.refresh_job = None
+        self.window.destroy()
 
     def refresh_connections(self) -> None:
         if self.refresh_job is not None:
