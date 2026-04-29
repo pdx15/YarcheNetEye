@@ -1,5 +1,6 @@
 import ipaddress
 import json
+import hashlib
 import socket
 import tkinter as tk
 from dataclasses import dataclass
@@ -200,6 +201,8 @@ class NetworkMonitorApp:
         self.rows: list[NetworkConnection] = []
         self.events: list[ConnectionEvent] = []
         self.seen_connections: set[tuple[object, ...]] = set()
+        self.current_open_groups: set[str] = set()
+        self.log_open_groups: set[str] = set()
         self.baseline_loaded = False
         self.refresh_job: str | None = None
 
@@ -554,14 +557,18 @@ class NetworkMonitorApp:
         return filtered
 
     def render_tables(self) -> None:
+        if self.group_by_process_var.get():
+            self.current_open_groups = self.read_open_groups(self.current_tree, "current")
+            self.log_open_groups = self.read_open_groups(self.log_tree, "log")
+
         self.current_tree.delete(*self.current_tree.get_children())
         self.log_tree.delete(*self.log_tree.get_children())
 
         current_rows = self.filtered_connections(self.rows)
         log_events = self.filtered_events(self.events)
         if self.group_by_process_var.get():
-            self.render_grouped_connections(self.current_tree, current_rows)
-            self.render_grouped_events(self.log_tree, log_events)
+            self.render_grouped_connections(self.current_tree, current_rows, "current", self.current_open_groups)
+            self.render_grouped_events(self.log_tree, log_events, "log", self.log_open_groups)
             return
 
         for row in current_rows:
@@ -570,14 +577,41 @@ class NetworkMonitorApp:
         for event in log_events:
             self.log_tree.insert("", tk.END, values=(event.first_seen, *self.connection_values(event.connection)))
 
-    def render_grouped_connections(self, tree: ttk.Treeview, rows: list[NetworkConnection]) -> None:
+    def read_open_groups(self, tree: ttk.Treeview, prefix: str) -> set[str]:
+        open_groups: set[str] = set()
+        prefix_text = f"{prefix}:"
+        for item_id in tree.get_children():
+            if str(item_id).startswith(prefix_text) and tree.item(item_id, "open"):
+                open_groups.add(str(item_id).removeprefix(prefix_text))
+        return open_groups
+
+    def render_grouped_connections(
+        self,
+        tree: ttk.Treeview,
+        rows: list[NetworkConnection],
+        prefix: str,
+        open_groups: set[str],
+    ) -> None:
         for group_key, group_rows in self.group_connections(rows).items():
-            parent = tree.insert("", tk.END, text=self.group_title(group_key, len(group_rows)), values=self.group_values(group_key))
+            group_id = self.group_id(group_key)
+            parent = tree.insert(
+                "",
+                tk.END,
+                iid=f"{prefix}:{group_id}",
+                text=self.group_title(group_key, len(group_rows)),
+                values=self.group_values(group_key),
+                open=group_id in open_groups,
+            )
             for row in group_rows:
                 tree.insert(parent, tk.END, values=self.connection_values(row))
-            tree.item(parent, open=True)
 
-    def render_grouped_events(self, tree: ttk.Treeview, events: list[ConnectionEvent]) -> None:
+    def render_grouped_events(
+        self,
+        tree: ttk.Treeview,
+        events: list[ConnectionEvent],
+        prefix: str,
+        open_groups: set[str],
+    ) -> None:
         groups: dict[tuple[object, ...], list[ConnectionEvent]] = {}
         for event in events:
             groups.setdefault(self.process_group_key(event.connection), []).append(event)
@@ -589,15 +623,17 @@ class NetworkMonitorApp:
             )
         )
         for group_key, group_events in sorted_groups.items():
+            group_id = self.group_id(group_key)
             parent = tree.insert(
                 "",
                 tk.END,
+                iid=f"{prefix}:{group_id}",
                 text=self.group_title(group_key, len(group_events)),
                 values=("", *self.group_values(group_key)),
+                open=group_id in open_groups,
             )
             for event in group_events:
                 tree.insert(parent, tk.END, values=(event.first_seen, *self.connection_values(event.connection)))
-            tree.item(parent, open=True)
 
     def group_connections(self, rows: list[NetworkConnection]) -> dict[tuple[object, ...], list[NetworkConnection]]:
         groups: dict[tuple[object, ...], list[NetworkConnection]] = {}
@@ -613,6 +649,9 @@ class NetworkMonitorApp:
 
     def process_group_key(self, row: NetworkConnection) -> tuple[object, ...]:
         return (row.pid, row.process_name, row.process_path)
+
+    def group_id(self, group_key: tuple[object, ...]) -> str:
+        return hashlib.sha1(repr(group_key).encode("utf-8")).hexdigest()
 
     def group_title(self, group_key: tuple[object, ...], count: int) -> str:
         pid, process_name, _process_path = group_key
