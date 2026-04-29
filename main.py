@@ -1,3 +1,4 @@
+import ipaddress
 import socket
 import tkinter as tk
 from dataclasses import dataclass
@@ -9,10 +10,8 @@ try:
 except ImportError:
     psutil = None
 
-
 APP_TITLE = "Yarche Net Eye"
 REFRESH_MS = 2000
-
 
 @dataclass(frozen=True)
 class NetworkConnection:
@@ -26,15 +25,40 @@ class NetworkConnection:
     remote_port: str
     status: str
 
+    @property
+    def identity(self) -> tuple[object, ...]:
+        return (
+            self.pid,
+            self.process_name,
+            self.protocol,
+            self.local_address,
+            self.local_port,
+            self.remote_address,
+            self.remote_port,
+        )
+
+@dataclass(frozen=True)
+class ConnectionEvent:
+    first_seen: str
+    connection: NetworkConnection
 
 def endpoint_host(endpoint: object) -> str:
     return getattr(endpoint, "ip", "") if endpoint else ""
-
 
 def endpoint_port(endpoint: object) -> str:
     port = getattr(endpoint, "port", "") if endpoint else ""
     return str(port) if port != "" else ""
 
+def is_external_address(address: str) -> bool:
+    if not address:
+        return False
+
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+
+    return ip.is_global
 
 def get_process_info(pid: int | None, cache: dict[int, tuple[str, str]]) -> tuple[str, str]:
     if pid is None:
@@ -62,7 +86,6 @@ def get_process_info(pid: int | None, cache: dict[int, tuple[str, str]]) -> tupl
 
     cache[pid] = info
     return info
-
 
 def get_network_connections() -> list[NetworkConnection]:
     if psutil is None:
@@ -92,18 +115,22 @@ def get_network_connections() -> list[NetworkConnection]:
 
     return rows
 
-
 class NetworkMonitorApp:
     def __init__(self, window: tk.Tk) -> None:
         self.window = window
         self.window.title(APP_TITLE)
-        self.window.geometry("1280x720")
-        self.window.minsize(980, 560)
+        self.window.geometry("1320x760")
+        self.window.minsize(1020, 600)
 
         self.search_var = tk.StringVar()
         self.auto_refresh_var = tk.BooleanVar(value=True)
+        self.external_only_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="Готово")
+
         self.rows: list[NetworkConnection] = []
+        self.events: list[ConnectionEvent] = []
+        self.seen_connections: set[tuple[object, ...]] = set()
+        self.baseline_loaded = False
         self.refresh_job: str | None = None
 
         self.build_layout()
@@ -122,10 +149,18 @@ class NetworkMonitorApp:
 
         search = ttk.Entry(header, textvariable=self.search_var)
         search.grid(row=0, column=1, sticky="ew", padx=(0, 12))
-        search.bind("<KeyRelease>", lambda _event: self.render_rows())
+        search.bind("<KeyRelease>", lambda _event: self.render_tables())
 
         refresh_button = ttk.Button(header, text="Обновить", command=self.refresh_connections)
         refresh_button.grid(row=0, column=2, padx=(0, 12))
+
+        external_only = ttk.Checkbutton(
+            header,
+            text="Только внешние",
+            variable=self.external_only_var,
+            command=self.render_tables,
+        )
+        external_only.grid(row=0, column=3, padx=(0, 12))
 
         auto_refresh = ttk.Checkbutton(
             header,
@@ -133,52 +168,18 @@ class NetworkMonitorApp:
             variable=self.auto_refresh_var,
             command=self.schedule_refresh,
         )
-        auto_refresh.grid(row=0, column=3)
+        auto_refresh.grid(row=0, column=4)
 
-        table_frame = ttk.Frame(self.window, padding=(16, 0, 16, 8))
-        table_frame.grid(row=1, column=0, sticky="nsew")
-        table_frame.columnconfigure(0, weight=1)
-        table_frame.rowconfigure(0, weight=1)
+        notebook = ttk.Notebook(self.window)
+        notebook.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 8))
 
-        columns = (
-            "pid",
-            "process",
-            "protocol",
-            "local_address",
-            "local_port",
-            "remote_address",
-            "remote_port",
-            "status",
-            "path",
-        )
-        self.tree = ttk.Treeview(table_frame, columns=columns, show="headings")
-        self.tree.heading("pid", text="PID")
-        self.tree.heading("process", text="Процесс")
-        self.tree.heading("protocol", text="Тип")
-        self.tree.heading("local_address", text="Локальный адрес")
-        self.tree.heading("local_port", text="Локальный порт")
-        self.tree.heading("remote_address", text="Удаленный адрес")
-        self.tree.heading("remote_port", text="Удаленный порт")
-        self.tree.heading("status", text="Состояние")
-        self.tree.heading("path", text="Путь")
+        current_frame = ttk.Frame(notebook)
+        log_frame = ttk.Frame(notebook)
+        notebook.add(current_frame, text="Текущие соединения")
+        notebook.add(log_frame, text="Журнал новых подключений")
 
-        self.tree.column("pid", width=80, anchor="center", stretch=False)
-        self.tree.column("process", width=170, anchor="w")
-        self.tree.column("protocol", width=70, anchor="center", stretch=False)
-        self.tree.column("local_address", width=180, anchor="w")
-        self.tree.column("local_port", width=110, anchor="center", stretch=False)
-        self.tree.column("remote_address", width=180, anchor="w")
-        self.tree.column("remote_port", width=110, anchor="center", stretch=False)
-        self.tree.column("status", width=130, anchor="center")
-        self.tree.column("path", width=260, anchor="w")
-
-        y_scroll = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=self.tree.yview)
-        x_scroll = ttk.Scrollbar(table_frame, orient=tk.HORIZONTAL, command=self.tree.xview)
-        self.tree.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
-
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        y_scroll.grid(row=0, column=1, sticky="ns")
-        x_scroll.grid(row=1, column=0, sticky="ew")
+        self.current_tree = self.create_connection_table(current_frame, include_time=False)
+        self.log_tree = self.create_connection_table(log_frame, include_time=True)
 
         footer = ttk.Frame(self.window, padding=(16, 4, 16, 14))
         footer.grid(row=2, column=0, sticky="ew")
@@ -186,6 +187,70 @@ class NetworkMonitorApp:
 
         status = ttk.Label(footer, textvariable=self.status_var, foreground="#4b5563")
         status.grid(row=0, column=0, sticky="w")
+
+    def create_connection_table(self, parent: ttk.Frame, include_time: bool) -> ttk.Treeview:
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(0, weight=1)
+
+        columns = []
+        if include_time:
+            columns.append("first_seen")
+        columns.extend(
+            [
+                "pid",
+                "process",
+                "protocol",
+                "local_address",
+                "local_port",
+                "remote_address",
+                "remote_port",
+                "status",
+                "path",
+            ]
+        )
+
+        tree = ttk.Treeview(parent, columns=tuple(columns), show="headings")
+
+        headings = {
+            "first_seen": "Время",
+            "pid": "PID",
+            "process": "Процесс",
+            "protocol": "Тип",
+            "local_address": "Локальный адрес",
+            "local_port": "Локальный порт",
+            "remote_address": "Удаленный адрес",
+            "remote_port": "Удаленный порт",
+            "status": "Состояние",
+            "path": "Путь",
+        }
+        widths = {
+            "first_seen": 90,
+            "pid": 80,
+            "process": 170,
+            "protocol": 70,
+            "local_address": 180,
+            "local_port": 110,
+            "remote_address": 180,
+            "remote_port": 110,
+            "status": 130,
+            "path": 260,
+        }
+
+        for column in columns:
+            tree.heading(column, text=headings[column])
+            anchor = "center" if column in {"first_seen", "pid", "protocol", "local_port", "remote_port", "status"} else "w"
+            stretch = column not in {"first_seen", "pid", "protocol", "local_port", "remote_port"}
+            tree.column(column, width=widths[column], anchor=anchor, stretch=stretch)
+
+        y_scroll = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=tree.yview)
+        x_scroll = ttk.Scrollbar(parent, orient=tk.HORIZONTAL, command=tree.xview)
+        tree.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+
+        tree.grid(row=0, column=0, sticky="nsew")
+        y_scroll.grid(row=0, column=1, sticky="ns")
+        x_scroll.grid(row=1, column=0, sticky="ew")
+
+        return tree
 
     def refresh_connections(self) -> None:
         if self.refresh_job is not None:
@@ -203,16 +268,36 @@ class NetworkMonitorApp:
                     item.remote_port,
                 )
             )
-            self.render_rows()
+            new_events = self.record_new_connections(self.rows)
+            self.render_tables()
 
             timestamp = datetime.now().strftime("%H:%M:%S")
+            visible_current = len(self.filtered_connections(self.rows))
+            visible_events = len(self.filtered_events(self.events))
             self.status_var.set(
-                f"Обновлено: {timestamp} | соединений: {len(self.rows)} | источник: psutil"
+                f"Обновлено: {timestamp} | текущих: {visible_current}/{len(self.rows)} | "
+                f"новых: +{new_events} | журнал: {visible_events}/{len(self.events)}"
             )
         except Exception as error:
             self.status_var.set(f"Ошибка чтения сетевой активности: {error}")
 
         self.schedule_refresh()
+
+    def record_new_connections(self, rows: list[NetworkConnection]) -> int:
+        identities = {row.identity for row in rows}
+
+        if not self.baseline_loaded:
+            self.seen_connections = identities
+            self.baseline_loaded = True
+            return 0
+
+        new_rows = [row for row in rows if row.identity not in self.seen_connections]
+        first_seen = datetime.now().strftime("%H:%M:%S")
+        for row in new_rows:
+            self.events.insert(0, ConnectionEvent(first_seen=first_seen, connection=row))
+
+        self.seen_connections.update(identities)
+        return len(new_rows)
 
     def schedule_refresh(self) -> None:
         if self.refresh_job is not None:
@@ -222,27 +307,68 @@ class NetworkMonitorApp:
         if self.auto_refresh_var.get():
             self.refresh_job = self.window.after(REFRESH_MS, self.refresh_connections)
 
-    def render_rows(self) -> None:
+    def filtered_connections(self, rows: list[NetworkConnection]) -> list[NetworkConnection]:
         query = self.search_var.get().strip().lower()
+        external_only = self.external_only_var.get()
+        filtered: list[NetworkConnection] = []
 
-        self.tree.delete(*self.tree.get_children())
-        for row in self.rows:
-            values = (
-                row.pid if row.pid is not None else "-",
-                row.process_name,
-                row.protocol,
-                row.local_address or "-",
-                row.local_port or "-",
-                row.remote_address or "-",
-                row.remote_port or "-",
-                row.status,
-                row.process_path or "-",
-            )
+        for row in rows:
+            if external_only and not is_external_address(row.remote_address):
+                continue
+
+            values = self.connection_values(row)
             searchable = " ".join(str(value).lower() for value in values)
             if query and query not in searchable:
                 continue
-            self.tree.insert("", tk.END, values=values)
 
+            filtered.append(row)
+
+        return filtered
+
+    def filtered_events(self, events: list[ConnectionEvent]) -> list[ConnectionEvent]:
+        query = self.search_var.get().strip().lower()
+        external_only = self.external_only_var.get()
+        filtered: list[ConnectionEvent] = []
+
+        for event in events:
+            row = event.connection
+            if external_only and not is_external_address(row.remote_address):
+                continue
+
+            values = (event.first_seen, *self.connection_values(row))
+            searchable = " ".join(str(value).lower() for value in values)
+            if query and query not in searchable:
+                continue
+
+            filtered.append(event)
+
+        return filtered
+
+    def render_tables(self) -> None:
+        self.current_tree.delete(*self.current_tree.get_children())
+        for row in self.filtered_connections(self.rows):
+            self.current_tree.insert("", tk.END, values=self.connection_values(row))
+
+        self.log_tree.delete(*self.log_tree.get_children())
+        for event in self.filtered_events(self.events):
+            self.log_tree.insert(
+                "",
+                tk.END,
+                values=(event.first_seen, *self.connection_values(event.connection)),
+            )
+
+    def connection_values(self, row: NetworkConnection) -> tuple[object, ...]:
+        return (
+            row.pid if row.pid is not None else "-",
+            row.process_name,
+            row.protocol,
+            row.local_address or "-",
+            row.local_port or "-",
+            row.remote_address or "-",
+            row.remote_port or "-",
+            row.status,
+            row.process_path or "-",
+        )
 
 def main() -> None:
     if psutil is None:
@@ -255,7 +381,6 @@ def main() -> None:
     window = tk.Tk()
     NetworkMonitorApp(window)
     window.mainloop()
-
 
 if __name__ == "__main__":
     main()
