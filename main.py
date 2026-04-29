@@ -12,6 +12,23 @@ except ImportError:
 
 APP_TITLE = "Yarche Net Eye"
 REFRESH_MS = 2000
+ALL_PROTOCOLS = "Все типы"
+ALL_STATUSES = "Все состояния"
+
+COLUMNS = {
+    "pid": {"title": "PID", "width": 80, "anchor": "center", "stretch": False},
+    "process": {"title": "Процесс", "width": 170, "anchor": "w", "stretch": True},
+    "protocol": {"title": "Тип", "width": 70, "anchor": "center", "stretch": False},
+    "local_address": {"title": "Локальный адрес", "width": 180, "anchor": "w", "stretch": True},
+    "local_port": {"title": "Локальный порт", "width": 110, "anchor": "center", "stretch": False},
+    "remote_address": {"title": "Удаленный адрес", "width": 180, "anchor": "w", "stretch": True},
+    "remote_port": {"title": "Удаленный порт", "width": 110, "anchor": "center", "stretch": False},
+    "status": {"title": "Состояние", "width": 130, "anchor": "center", "stretch": True},
+    "path": {"title": "Путь", "width": 260, "anchor": "w", "stretch": True},
+}
+CURRENT_COLUMNS = tuple(COLUMNS)
+LOG_COLUMNS = ("first_seen", *CURRENT_COLUMNS)
+LOG_TIME_COLUMN = {"title": "Время", "width": 90, "anchor": "center", "stretch": False}
 
 @dataclass(frozen=True)
 class NetworkConnection:
@@ -119,13 +136,18 @@ class NetworkMonitorApp:
     def __init__(self, window: tk.Tk) -> None:
         self.window = window
         self.window.title(APP_TITLE)
-        self.window.geometry("1320x760")
-        self.window.minsize(1020, 600)
+        self.window.geometry("1360x780")
+        self.window.minsize(1080, 620)
 
         self.search_var = tk.StringVar()
+        self.protocol_filter_var = tk.StringVar(value=ALL_PROTOCOLS)
+        self.status_filter_var = tk.StringVar(value=ALL_STATUSES)
         self.auto_refresh_var = tk.BooleanVar(value=True)
         self.external_only_var = tk.BooleanVar(value=False)
+        self.with_remote_only_var = tk.BooleanVar(value=False)
+        self.established_only_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="Готово")
+        self.column_vars = {column: tk.BooleanVar(value=True) for column in CURRENT_COLUMNS}
 
         self.rows: list[NetworkConnection] = []
         self.events: list[ConnectionEvent] = []
@@ -133,12 +155,32 @@ class NetworkMonitorApp:
         self.baseline_loaded = False
         self.refresh_job: str | None = None
 
+        self.build_menu()
         self.build_layout()
         self.refresh_connections()
 
+    def build_menu(self) -> None:
+        menu_bar = tk.Menu(self.window)
+
+        settings_menu = tk.Menu(menu_bar, tearoff=False)
+        fields_menu = tk.Menu(settings_menu, tearoff=False)
+        for column in CURRENT_COLUMNS:
+            fields_menu.add_checkbutton(
+                label=COLUMNS[column]["title"],
+                variable=self.column_vars[column],
+                command=self.update_visible_columns,
+            )
+
+        settings_menu.add_cascade(label="Поля таблицы", menu=fields_menu)
+        settings_menu.add_separator()
+        settings_menu.add_command(label="Показать все поля", command=self.show_all_columns)
+        menu_bar.add_cascade(label="Настройки", menu=settings_menu)
+
+        self.window.config(menu=menu_bar)
+
     def build_layout(self) -> None:
         self.window.columnconfigure(0, weight=1)
-        self.window.rowconfigure(1, weight=1)
+        self.window.rowconfigure(1, weight=0)
 
         header = ttk.Frame(self.window, padding=(16, 14, 16, 8))
         header.grid(row=0, column=0, sticky="ew")
@@ -154,93 +196,102 @@ class NetworkMonitorApp:
         refresh_button = ttk.Button(header, text="Обновить", command=self.refresh_connections)
         refresh_button.grid(row=0, column=2, padx=(0, 12))
 
-        external_only = ttk.Checkbutton(
-            header,
-            text="Только внешние",
-            variable=self.external_only_var,
-            command=self.render_tables,
-        )
-        external_only.grid(row=0, column=3, padx=(0, 12))
-
         auto_refresh = ttk.Checkbutton(
             header,
             text="Автообновление",
             variable=self.auto_refresh_var,
             command=self.schedule_refresh,
         )
-        auto_refresh.grid(row=0, column=4)
+        auto_refresh.grid(row=0, column=3)
+
+        filters = ttk.Frame(self.window, padding=(16, 0, 16, 8))
+        filters.grid(row=1, column=0, sticky="ew")
+        filters.columnconfigure(8, weight=1)
+
+        ttk.Label(filters, text="Тип").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        protocol_filter = ttk.Combobox(
+            filters,
+            textvariable=self.protocol_filter_var,
+            values=(ALL_PROTOCOLS, "TCP", "UDP"),
+            state="readonly",
+            width=12,
+        )
+        protocol_filter.grid(row=0, column=1, sticky="w", padx=(0, 14))
+        protocol_filter.bind("<<ComboboxSelected>>", lambda _event: self.render_tables())
+
+        ttk.Label(filters, text="Состояние").grid(row=0, column=2, sticky="w", padx=(0, 6))
+        status_filter = ttk.Combobox(
+            filters,
+            textvariable=self.status_filter_var,
+            values=(ALL_STATUSES, "ESTABLISHED", "LISTEN", "TIME_WAIT", "CLOSE_WAIT", "SYN_SENT", "UDP"),
+            state="readonly",
+            width=16,
+        )
+        status_filter.grid(row=0, column=3, sticky="w", padx=(0, 14))
+        status_filter.bind("<<ComboboxSelected>>", lambda _event: self.render_tables())
+
+        external_only = ttk.Checkbutton(
+            filters,
+            text="Только внешние",
+            variable=self.external_only_var,
+            command=self.render_tables,
+        )
+        external_only.grid(row=0, column=4, sticky="w", padx=(0, 14))
+
+        with_remote_only = ttk.Checkbutton(
+            filters,
+            text="С удаленным адресом",
+            variable=self.with_remote_only_var,
+            command=self.render_tables,
+        )
+        with_remote_only.grid(row=0, column=5, sticky="w", padx=(0, 14))
+
+        established_only = ttk.Checkbutton(
+            filters,
+            text="Только ESTABLISHED",
+            variable=self.established_only_var,
+            command=self.render_tables,
+        )
+        established_only.grid(row=0, column=6, sticky="w", padx=(0, 14))
+
+        reset_button = ttk.Button(filters, text="Сбросить фильтры", command=self.reset_filters)
+        reset_button.grid(row=0, column=7, sticky="w")
 
         notebook = ttk.Notebook(self.window)
-        notebook.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 8))
+        notebook.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 8))
+        self.window.rowconfigure(2, weight=1)
 
         current_frame = ttk.Frame(notebook)
         log_frame = ttk.Frame(notebook)
         notebook.add(current_frame, text="Текущие соединения")
         notebook.add(log_frame, text="Журнал новых подключений")
 
-        self.current_tree = self.create_connection_table(current_frame, include_time=False)
-        self.log_tree = self.create_connection_table(log_frame, include_time=True)
+        self.current_tree = self.create_connection_table(current_frame, CURRENT_COLUMNS)
+        self.log_tree = self.create_connection_table(log_frame, LOG_COLUMNS)
+        self.update_visible_columns()
 
         footer = ttk.Frame(self.window, padding=(16, 4, 16, 14))
-        footer.grid(row=2, column=0, sticky="ew")
+        footer.grid(row=3, column=0, sticky="ew")
         footer.columnconfigure(0, weight=1)
 
         status = ttk.Label(footer, textvariable=self.status_var, foreground="#4b5563")
         status.grid(row=0, column=0, sticky="w")
 
-    def create_connection_table(self, parent: ttk.Frame, include_time: bool) -> ttk.Treeview:
+    def create_connection_table(self, parent: ttk.Frame, columns: tuple[str, ...]) -> ttk.Treeview:
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(0, weight=1)
 
-        columns = []
-        if include_time:
-            columns.append("first_seen")
-        columns.extend(
-            [
-                "pid",
-                "process",
-                "protocol",
-                "local_address",
-                "local_port",
-                "remote_address",
-                "remote_port",
-                "status",
-                "path",
-            ]
-        )
-
-        tree = ttk.Treeview(parent, columns=tuple(columns), show="headings")
-
-        headings = {
-            "first_seen": "Время",
-            "pid": "PID",
-            "process": "Процесс",
-            "protocol": "Тип",
-            "local_address": "Локальный адрес",
-            "local_port": "Локальный порт",
-            "remote_address": "Удаленный адрес",
-            "remote_port": "Удаленный порт",
-            "status": "Состояние",
-            "path": "Путь",
-        }
-        widths = {
-            "first_seen": 90,
-            "pid": 80,
-            "process": 170,
-            "protocol": 70,
-            "local_address": 180,
-            "local_port": 110,
-            "remote_address": 180,
-            "remote_port": 110,
-            "status": 130,
-            "path": 260,
-        }
+        tree = ttk.Treeview(parent, columns=columns, show="headings")
 
         for column in columns:
-            tree.heading(column, text=headings[column])
-            anchor = "center" if column in {"first_seen", "pid", "protocol", "local_port", "remote_port", "status"} else "w"
-            stretch = column not in {"first_seen", "pid", "protocol", "local_port", "remote_port"}
-            tree.column(column, width=widths[column], anchor=anchor, stretch=stretch)
+            config = LOG_TIME_COLUMN if column == "first_seen" else COLUMNS[column]
+            tree.heading(column, text=config["title"])
+            tree.column(
+                column,
+                width=config["width"],
+                anchor=config["anchor"],
+                stretch=config["stretch"],
+            )
 
         y_scroll = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=tree.yview)
         x_scroll = ttk.Scrollbar(parent, orient=tk.HORIZONTAL, command=tree.xview)
@@ -251,6 +302,29 @@ class NetworkMonitorApp:
         x_scroll.grid(row=1, column=0, sticky="ew")
 
         return tree
+
+    def show_all_columns(self) -> None:
+        for variable in self.column_vars.values():
+            variable.set(True)
+        self.update_visible_columns()
+
+    def update_visible_columns(self) -> None:
+        visible = [column for column in CURRENT_COLUMNS if self.column_vars[column].get()]
+        if not visible:
+            visible = ["process"]
+            self.column_vars["process"].set(True)
+
+        self.current_tree.configure(displaycolumns=tuple(visible))
+        self.log_tree.configure(displaycolumns=("first_seen", *visible))
+
+    def reset_filters(self) -> None:
+        self.search_var.set("")
+        self.protocol_filter_var.set(ALL_PROTOCOLS)
+        self.status_filter_var.set(ALL_STATUSES)
+        self.external_only_var.set(False)
+        self.with_remote_only_var.set(False)
+        self.established_only_var.set(False)
+        self.render_tables()
 
     def refresh_connections(self) -> None:
         if self.refresh_job is not None:
@@ -307,13 +381,33 @@ class NetworkMonitorApp:
         if self.auto_refresh_var.get():
             self.refresh_job = self.window.after(REFRESH_MS, self.refresh_connections)
 
+    def row_matches_filters(self, row: NetworkConnection) -> bool:
+        protocol_filter = self.protocol_filter_var.get()
+        status_filter = self.status_filter_var.get()
+
+        if protocol_filter != ALL_PROTOCOLS and row.protocol != protocol_filter:
+            return False
+
+        if status_filter != ALL_STATUSES and row.status != status_filter:
+            return False
+
+        if self.external_only_var.get() and not is_external_address(row.remote_address):
+            return False
+
+        if self.with_remote_only_var.get() and not row.remote_address:
+            return False
+
+        if self.established_only_var.get() and row.status != "ESTABLISHED":
+            return False
+
+        return True
+
     def filtered_connections(self, rows: list[NetworkConnection]) -> list[NetworkConnection]:
         query = self.search_var.get().strip().lower()
-        external_only = self.external_only_var.get()
         filtered: list[NetworkConnection] = []
 
         for row in rows:
-            if external_only and not is_external_address(row.remote_address):
+            if not self.row_matches_filters(row):
                 continue
 
             values = self.connection_values(row)
@@ -327,12 +421,11 @@ class NetworkMonitorApp:
 
     def filtered_events(self, events: list[ConnectionEvent]) -> list[ConnectionEvent]:
         query = self.search_var.get().strip().lower()
-        external_only = self.external_only_var.get()
         filtered: list[ConnectionEvent] = []
 
         for event in events:
             row = event.connection
-            if external_only and not is_external_address(row.remote_address):
+            if not self.row_matches_filters(row):
                 continue
 
             values = (event.first_seen, *self.connection_values(row))
