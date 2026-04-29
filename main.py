@@ -169,8 +169,10 @@ class NetworkMonitorApp:
 
         self.settings = load_settings()
         filters = self.settings.get("filters", {})
+        view = self.settings.get("view", {})
         columns = self.settings.get("columns", {})
         filters = filters if isinstance(filters, dict) else {}
+        view = view if isinstance(view, dict) else {}
         columns = columns if isinstance(columns, dict) else {}
 
         self.search_var = tk.StringVar(value=text_setting(filters.get("search"), ""))
@@ -188,6 +190,7 @@ class NetworkMonitorApp:
         self.external_only_var = tk.BooleanVar(value=bool_setting(filters.get("external_only"), False))
         self.with_remote_only_var = tk.BooleanVar(value=bool_setting(filters.get("with_remote_only"), False))
         self.established_only_var = tk.BooleanVar(value=bool_setting(filters.get("established_only"), False))
+        self.group_by_process_var = tk.BooleanVar(value=bool_setting(view.get("group_by_process"), False))
         self.status_var = tk.StringVar(value="Готово")
         self.column_vars = {
             column: tk.BooleanVar(value=bool_setting(columns.get(column), True))
@@ -251,7 +254,7 @@ class NetworkMonitorApp:
 
         filters = ttk.Frame(self.window, padding=(16, 0, 16, 8))
         filters.grid(row=1, column=0, sticky="ew")
-        filters.columnconfigure(8, weight=1)
+        filters.columnconfigure(9, weight=1)
 
         ttk.Label(filters, text="Тип").grid(row=0, column=0, sticky="w", padx=(0, 6))
         protocol_filter = ttk.Combobox(
@@ -299,8 +302,16 @@ class NetworkMonitorApp:
         )
         established_only.grid(row=0, column=6, sticky="w", padx=(0, 14))
 
+        group_by_process = ttk.Checkbutton(
+            filters,
+            text="Группировать по процессам",
+            variable=self.group_by_process_var,
+            command=self.on_view_changed,
+        )
+        group_by_process.grid(row=0, column=7, sticky="w", padx=(0, 14))
+
         reset_button = ttk.Button(filters, text="Сбросить фильтры", command=self.reset_filters)
-        reset_button.grid(row=0, column=7, sticky="w")
+        reset_button.grid(row=0, column=8, sticky="w")
 
         notebook = ttk.Notebook(self.window)
         notebook.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 8))
@@ -327,6 +338,8 @@ class NetworkMonitorApp:
         parent.rowconfigure(0, weight=1)
 
         tree = ttk.Treeview(parent, columns=columns, show="headings")
+        tree.heading("#0", text="Группа")
+        tree.column("#0", width=0, minwidth=0, stretch=False)
 
         for column in columns:
             config = LOG_TIME_COLUMN if column == "first_seen" else COLUMNS[column]
@@ -361,6 +374,7 @@ class NetworkMonitorApp:
 
         self.current_tree.configure(displaycolumns=tuple(visible))
         self.log_tree.configure(displaycolumns=("first_seen", *visible))
+        self.update_tree_mode()
         self.save_settings()
 
     def reset_filters(self) -> None:
@@ -380,6 +394,21 @@ class NetworkMonitorApp:
         self.schedule_refresh()
         self.save_settings()
 
+    def on_view_changed(self) -> None:
+        self.update_tree_mode()
+        self.render_tables()
+        self.save_settings()
+
+    def update_tree_mode(self) -> None:
+        if self.group_by_process_var.get():
+            for tree in (self.current_tree, self.log_tree):
+                tree.configure(show="tree headings")
+                tree.column("#0", width=240, minwidth=180, stretch=False)
+        else:
+            for tree in (self.current_tree, self.log_tree):
+                tree.configure(show="headings")
+                tree.column("#0", width=0, minwidth=0, stretch=False)
+
     def save_settings(self) -> None:
         settings = {
             "filters": {
@@ -390,6 +419,9 @@ class NetworkMonitorApp:
                 "external_only": self.external_only_var.get(),
                 "with_remote_only": self.with_remote_only_var.get(),
                 "established_only": self.established_only_var.get(),
+            },
+            "view": {
+                "group_by_process": self.group_by_process_var.get(),
             },
             "columns": {
                 column: variable.get()
@@ -523,16 +555,83 @@ class NetworkMonitorApp:
 
     def render_tables(self) -> None:
         self.current_tree.delete(*self.current_tree.get_children())
-        for row in self.filtered_connections(self.rows):
+        self.log_tree.delete(*self.log_tree.get_children())
+
+        current_rows = self.filtered_connections(self.rows)
+        log_events = self.filtered_events(self.events)
+        if self.group_by_process_var.get():
+            self.render_grouped_connections(self.current_tree, current_rows)
+            self.render_grouped_events(self.log_tree, log_events)
+            return
+
+        for row in current_rows:
             self.current_tree.insert("", tk.END, values=self.connection_values(row))
 
-        self.log_tree.delete(*self.log_tree.get_children())
-        for event in self.filtered_events(self.events):
-            self.log_tree.insert(
+        for event in log_events:
+            self.log_tree.insert("", tk.END, values=(event.first_seen, *self.connection_values(event.connection)))
+
+    def render_grouped_connections(self, tree: ttk.Treeview, rows: list[NetworkConnection]) -> None:
+        for group_key, group_rows in self.group_connections(rows).items():
+            parent = tree.insert("", tk.END, text=self.group_title(group_key, len(group_rows)), values=self.group_values(group_key))
+            for row in group_rows:
+                tree.insert(parent, tk.END, values=self.connection_values(row))
+            tree.item(parent, open=True)
+
+    def render_grouped_events(self, tree: ttk.Treeview, events: list[ConnectionEvent]) -> None:
+        groups: dict[tuple[object, ...], list[ConnectionEvent]] = {}
+        for event in events:
+            groups.setdefault(self.process_group_key(event.connection), []).append(event)
+
+        sorted_groups = dict(
+            sorted(
+                groups.items(),
+                key=lambda item: (str(item[0][1]).lower(), int(item[0][0]) if isinstance(item[0][0], int) else -1),
+            )
+        )
+        for group_key, group_events in sorted_groups.items():
+            parent = tree.insert(
                 "",
                 tk.END,
-                values=(event.first_seen, *self.connection_values(event.connection)),
+                text=self.group_title(group_key, len(group_events)),
+                values=("", *self.group_values(group_key)),
             )
+            for event in group_events:
+                tree.insert(parent, tk.END, values=(event.first_seen, *self.connection_values(event.connection)))
+            tree.item(parent, open=True)
+
+    def group_connections(self, rows: list[NetworkConnection]) -> dict[tuple[object, ...], list[NetworkConnection]]:
+        groups: dict[tuple[object, ...], list[NetworkConnection]] = {}
+        for row in rows:
+            groups.setdefault(self.process_group_key(row), []).append(row)
+
+        return dict(
+            sorted(
+                groups.items(),
+                key=lambda item: (str(item[0][1]).lower(), int(item[0][0]) if isinstance(item[0][0], int) else -1),
+            )
+        )
+
+    def process_group_key(self, row: NetworkConnection) -> tuple[object, ...]:
+        return (row.pid, row.process_name, row.process_path)
+
+    def group_title(self, group_key: tuple[object, ...], count: int) -> str:
+        pid, process_name, _process_path = group_key
+        pid_text = pid if pid is not None else "-"
+        return f"{process_name} (PID {pid_text}) - {count}"
+
+    def group_values(self, group_key: tuple[object, ...]) -> tuple[object, ...]:
+        pid, process_name, process_path = group_key
+        return (
+            pid if pid is not None else "-",
+            process_name,
+            "-",
+            "-",
+            "-",
+            "-",
+            "-",
+            "Группа",
+            process_path or "-",
+        )
 
     def connection_values(self, row: NetworkConnection) -> tuple[object, ...]:
         return (
