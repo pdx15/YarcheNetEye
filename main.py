@@ -18,7 +18,33 @@ REFRESH_MS = 2000
 BASE_DIR = Path(__file__).resolve().parent
 SETTINGS_FILE = BASE_DIR / "settings.json"
 LOCALES_DIR = BASE_DIR / "locales"
-LOCALE_CODE = "ru"
+SUPPORTED_LANGUAGES = {
+    "ru": "Русский",
+    "en": "English",
+}
+
+def load_settings() -> dict[str, object]:
+    if not SETTINGS_FILE.exists():
+        return {}
+    try:
+        with SETTINGS_FILE.open("r", encoding="utf-8") as file:
+            settings = json.load(file)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return settings if isinstance(settings, dict) else {}
+
+def bool_setting(value: object, default: bool) -> bool:
+    return value if isinstance(value, bool) else default
+
+def text_setting(value: object, default: str, allowed: tuple[str, ...] | None = None) -> str:
+    if not isinstance(value, str):
+        return default
+    if allowed is not None and value not in allowed:
+        return default
+    return value
+
+INITIAL_SETTINGS = load_settings()
+LOCALE_CODE = text_setting(INITIAL_SETTINGS.get("language"), "ru", tuple(SUPPORTED_LANGUAGES))
 
 def load_locale(locale_code: str) -> dict[str, str]:
     locale_file = LOCALES_DIR / f"{locale_code}.json"
@@ -52,26 +78,6 @@ COLUMNS = {
 CURRENT_COLUMNS = tuple(COLUMNS)
 LOG_COLUMNS = ("first_seen", *CURRENT_COLUMNS)
 LOG_TIME_COLUMN = {"title": tr("column.first_seen"), "width": 90, "anchor": "center", "stretch": False}
-
-def load_settings() -> dict[str, object]:
-    if not SETTINGS_FILE.exists():
-        return {}
-    try:
-        with SETTINGS_FILE.open("r", encoding="utf-8") as file:
-            settings = json.load(file)
-    except (OSError, json.JSONDecodeError):
-        return {}
-    return settings if isinstance(settings, dict) else {}
-
-def bool_setting(value: object, default: bool) -> bool:
-    return value if isinstance(value, bool) else default
-
-def text_setting(value: object, default: str, allowed: tuple[str, ...] | None = None) -> str:
-    if not isinstance(value, str):
-        return default
-    if allowed is not None and value not in allowed:
-        return default
-    return value
 
 @dataclass(frozen=True)
 class NetworkConnection:
@@ -190,6 +196,7 @@ class NetworkMonitorApp:
         self.with_remote_only_var = tk.BooleanVar(value=bool_setting(filters.get("with_remote_only"), False))
         self.established_only_var = tk.BooleanVar(value=bool_setting(filters.get("established_only"), False))
         self.group_by_process_var = tk.BooleanVar(value=bool_setting(view.get("group_by_process"), False))
+        self.language_var = tk.StringVar(value=LOCALE_CODE)
         self.status_var = tk.StringVar(value=tr("status.ready"))
         self.column_vars = {
             column: tk.BooleanVar(value=bool_setting(columns.get(column), True))
@@ -220,6 +227,15 @@ class NetworkMonitorApp:
         settings_menu.add_separator()
         settings_menu.add_command(label=tr("menu.show_all_fields"), command=self.show_all_columns)
         menu_bar.add_cascade(label=tr("menu.settings"), menu=settings_menu)
+        language_menu = tk.Menu(menu_bar, tearoff=False)
+        for language_code, language_name in SUPPORTED_LANGUAGES.items():
+            language_menu.add_radiobutton(
+                label=language_name,
+                value=language_code,
+                variable=self.language_var,
+                command=self.on_language_changed,
+            )
+        menu_bar.add_cascade(label=tr("menu.language"), menu=language_menu)
         self.window.config(menu=menu_bar)
 
     def build_layout(self) -> None:
@@ -371,6 +387,10 @@ class NetworkMonitorApp:
         self.render_tables()
         self.save_settings()
 
+    def on_language_changed(self) -> None:
+        self.save_settings()
+        messagebox.showinfo(APP_TITLE, tr("message.restart_required"))
+
     def update_tree_mode(self) -> None:
         if self.group_by_process_var.get():
             for tree in (self.current_tree, self.log_tree):
@@ -383,6 +403,7 @@ class NetworkMonitorApp:
 
     def save_settings(self) -> None:
         settings = {
+            "language": self.language_var.get(),
             "filters": {
                 "search": self.search_var.get(),
                 "protocol": self.protocol_filter_var.get(),
