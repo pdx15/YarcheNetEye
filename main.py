@@ -1,8 +1,12 @@
 import hashlib
 import ipaddress
 import json
+import queue
 import socket
 import tkinter as tk
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -15,6 +19,7 @@ except ImportError:
 
 APP_TITLE = "Yarche Net Eye"
 REFRESH_MS = 2000
+LOOKUP_TIMEOUT = 1.5
 BASE_DIR = Path(__file__).resolve().parent
 SETTINGS_FILE = BASE_DIR / "settings.json"
 LOCALES_DIR = BASE_DIR / "locales"
@@ -64,6 +69,9 @@ def tr(key: str, **kwargs: object) -> str:
 ALL_PROTOCOLS = tr("filter.protocol.all")
 ALL_STATUSES = tr("filter.status.all")
 STATUS_OPTIONS = (ALL_STATUSES, "ESTABLISHED", "LISTEN", "TIME_WAIT", "CLOSE_WAIT", "SYN_SENT", "UDP")
+DOMAIN_CACHE: dict[str, str] = {}
+COUNTRY_CACHE: dict[str, str] = {}
+PENDING_LOOKUPS: set[str] = set()
 COLUMNS = {
     "pid": {"title": tr("column.pid"), "width": 80, "anchor": "center", "stretch": False},
     "process": {"title": tr("column.process"), "width": 170, "anchor": "w", "stretch": True},
@@ -72,6 +80,8 @@ COLUMNS = {
     "local_port": {"title": tr("column.local_port"), "width": 110, "anchor": "center", "stretch": False},
     "remote_address": {"title": tr("column.remote_address"), "width": 180, "anchor": "w", "stretch": True},
     "remote_port": {"title": tr("column.remote_port"), "width": 110, "anchor": "center", "stretch": False},
+    "remote_domain": {"title": tr("column.remote_domain"), "width": 220, "anchor": "w", "stretch": True},
+    "remote_country": {"title": tr("column.remote_country"), "width": 140, "anchor": "w", "stretch": True},
     "status": {"title": tr("column.status"), "width": 130, "anchor": "center", "stretch": True},
     "path": {"title": tr("column.path"), "width": 260, "anchor": "w", "stretch": True},
 }
@@ -123,6 +133,59 @@ def is_external_address(address: str) -> bool:
     except ValueError:
         return False
     return ip.is_global
+
+def address_label(address: str) -> str | None:
+    if not address:
+        return tr("network.empty")
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return tr("network.unknown")
+    if ip.is_loopback:
+        return tr("network.loopback")
+    if ip.is_private:
+        return tr("network.private")
+    if ip.is_link_local:
+        return tr("network.link_local")
+    if ip.is_multicast:
+        return tr("network.multicast")
+    if ip.is_reserved:
+        return tr("network.reserved")
+    if not ip.is_global:
+        return tr("network.local")
+    return None
+
+def remote_domain_value(address: str) -> str:
+    label = address_label(address)
+    if label is not None:
+        return label
+    return DOMAIN_CACHE.get(address, tr("network.resolving"))
+
+def remote_country_value(address: str) -> str:
+    label = address_label(address)
+    if label is not None:
+        return label
+    return COUNTRY_CACHE.get(address, tr("network.resolving"))
+
+def lookup_remote_domain(address: str) -> str:
+    try:
+        return socket.gethostbyaddr(address)[0]
+    except (OSError, socket.herror, socket.gaierror):
+        return tr("network.unknown")
+
+def lookup_remote_country(address: str) -> str:
+    url_address = urllib.parse.quote(address, safe="")
+    url = f"http://ip-api.com/json/{url_address}?fields=status,country"
+    try:
+        with urllib.request.urlopen(url, timeout=LOOKUP_TIMEOUT) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, TimeoutError, json.JSONDecodeError):
+        return tr("network.unknown")
+    if isinstance(payload, dict) and payload.get("status") == "success":
+        country = payload.get("country")
+        if isinstance(country, str) and country:
+            return country
+    return tr("network.unknown")
 
 def get_process_info(pid: int | None, cache: dict[int, tuple[str, str]]) -> tuple[str, str]:
     if pid is None:
@@ -209,8 +272,12 @@ class NetworkMonitorApp:
         self.log_open_groups: set[str] = set()
         self.baseline_loaded = False
         self.refresh_job: str | None = None
+        self.lookup_poll_job: str | None = None
+        self.lookup_results: queue.Queue[str] = queue.Queue()
+        self.lookup_executor = ThreadPoolExecutor(max_workers=4)
         self.build_menu()
         self.build_layout()
+        self.poll_lookup_results()
         self.refresh_connections()
 
     def build_menu(self) -> None:
@@ -432,6 +499,10 @@ class NetworkMonitorApp:
         if self.refresh_job is not None:
             self.window.after_cancel(self.refresh_job)
             self.refresh_job = None
+        if self.lookup_poll_job is not None:
+            self.window.after_cancel(self.lookup_poll_job)
+            self.lookup_poll_job = None
+        self.lookup_executor.shutdown(wait=False, cancel_futures=True)
         self.window.destroy()
 
     def refresh_connections(self) -> None:
@@ -450,6 +521,7 @@ class NetworkMonitorApp:
                 )
             )
             new_events = self.record_new_connections(self.rows)
+            self.schedule_remote_lookups(self.rows)
             self.render_tables()
             timestamp = datetime.now().strftime("%H:%M:%S")
             visible_current = len(self.filtered_connections(self.rows))
@@ -481,6 +553,40 @@ class NetworkMonitorApp:
             self.events.insert(0, ConnectionEvent(first_seen=first_seen, connection=row))
         self.seen_connections.update(identities)
         return len(new_rows)
+
+    def schedule_remote_lookups(self, rows: list[NetworkConnection]) -> None:
+        addresses = {
+            row.remote_address
+            for row in rows
+            if row.remote_address and is_external_address(row.remote_address)
+        }
+        for address in addresses:
+            if address in PENDING_LOOKUPS:
+                continue
+            if address in DOMAIN_CACHE and address in COUNTRY_CACHE:
+                continue
+            PENDING_LOOKUPS.add(address)
+            self.lookup_executor.submit(self.lookup_remote_info, address)
+
+    def lookup_remote_info(self, address: str) -> None:
+        if address not in DOMAIN_CACHE:
+            DOMAIN_CACHE[address] = lookup_remote_domain(address)
+        if address not in COUNTRY_CACHE:
+            COUNTRY_CACHE[address] = lookup_remote_country(address)
+        PENDING_LOOKUPS.discard(address)
+        self.lookup_results.put(address)
+
+    def poll_lookup_results(self) -> None:
+        has_updates = False
+        while True:
+            try:
+                self.lookup_results.get_nowait()
+            except queue.Empty:
+                break
+            has_updates = True
+        if has_updates:
+            self.render_tables()
+        self.lookup_poll_job = self.window.after(500, self.poll_lookup_results)
 
     def schedule_refresh(self) -> None:
         if self.refresh_job is not None:
@@ -637,6 +743,8 @@ class NetworkMonitorApp:
             "-",
             "-",
             "-",
+            "-",
+            "-",
             tr("group.status"),
             process_path or "-",
         )
@@ -650,6 +758,8 @@ class NetworkMonitorApp:
             row.local_port or "-",
             row.remote_address or "-",
             row.remote_port or "-",
+            remote_domain_value(row.remote_address),
+            remote_country_value(row.remote_address),
             row.status,
             row.process_path or "-",
         )
